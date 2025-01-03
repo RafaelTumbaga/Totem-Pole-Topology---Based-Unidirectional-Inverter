@@ -1,0 +1,154 @@
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+
+// Initialize ADS1115
+Adafruit_ADS1115 ads;
+
+// Voltage divider resistor values for Vinput (400V DC)
+const float R1_Vinput = 1000000.0; // 1M ohm
+const float R2_Vinput = 8200.0;    // 8.2k ohm
+const float dividerRatio_Vinput = (R1_Vinput + R2_Vinput) / R2_Vinput;
+
+// Voltage divider resistor values for Vload (220V AC)
+const float R1_Vload = 1000000.0; // 1M ohm
+const float R2_Vload = 8200.0;    // 8.2k ohm
+const float dividerRatio_Vload = (R1_Vload + R2_Vload) / R2_Vload;
+
+// Constants for current sensing (WCS1800)
+const float SENSOR_SENSITIVITY = 0.06; // 60 mV/A
+const float ADC_REFERENCE_VOLTAGE = 4.096; // Reference voltage for ADS1115 (Gain = 1)
+const int ADC_RESOLUTION = 32768; // 16-bit ADC (±32768)
+
+// Calibration offsets
+float IloadOffset = 0.0; 
+float IinverterOffset = 0.0;
+float VinputOffset = 0.0;
+float VloadOffset = 0.0;
+
+// Control Parameters for PI controllers
+float Kp1 = 0.0289, Ki1 = 20.0; // PI Controller 1 parameters
+float Kp2 = 29.0, Ki2 = 6.67;   // PI Controller 2 parameters
+float error1 = 0, error2 = 0;   // Error terms
+float integral1 = 0, integral2 = 0; // Integral terms
+float output1 = 0, output2 = 0; // Controller outputs
+
+// Sine wave parameters
+float sineAmplitude = 220.0;
+float sineFrequency = 2 * PI * 60; // 60 Hz frequency
+float sineWave = 0.0;
+
+// Repeating sequence parameters
+float repeatingSequence = -1;
+
+// Time parameters
+float timeStep = 0.00001; // 10 µs sampling time
+unsigned long previousTime = 0;
+
+// Pin assignments for PWM
+const int PWM_A_HS = 19; // Pin for PWM A_HS
+const int PWM_A_LS = 18; // Pin for PWM A_LS
+const int PWM_B_HS = 17; // Pin for PWM B_HS
+const int PWM_B_LS = 16; // Pin for PWM B_LS
+
+// Pin assignment for fan
+const int FAN_PIN = 2;
+
+void setup() {
+  // Initialize Serial Monitor
+  Serial.begin(115200);
+
+  // Initialize ADS1115
+  if (!ads.begin()) {
+    Serial.println("Failed to initialize ADS1115! Check wiring.");
+    while (1);
+  }
+  ads.setGain(GAIN_ONE); // Set gain to measure up to ±4.096V
+
+  // Initialize GPIO for PWM outputs
+  pinMode(PWM_A_HS, OUTPUT);
+  pinMode(PWM_A_LS, OUTPUT);
+  pinMode(PWM_B_HS, OUTPUT);
+  pinMode(PWM_B_LS, OUTPUT);
+
+  // Initialize GPIO for fan control and set it always on
+  pinMode(FAN_PIN, OUTPUT);
+  digitalWrite(FAN_PIN, HIGH);
+
+  // Calibrate sensors
+  Serial.println("Calibrating sensors...");
+  calibrateSensors();
+  Serial.println("Calibration complete.");
+}
+
+void loop() {
+  unsigned long currentTime = micros();
+  if (currentTime - previousTime >= timeStep * 1e6) { // Check time step
+    previousTime = currentTime;
+
+    // Read ADC values
+    float Vinput = (ads.readADC_SingleEnded(0) * ADC_REFERENCE_VOLTAGE / ADC_RESOLUTION) * dividerRatio_Vinput;
+    float Vload = (ads.readADC_SingleEnded(3) * ADC_REFERENCE_VOLTAGE / ADC_RESOLUTION) * dividerRatio_Vload;
+    float Iinverter = (ads.readADC_SingleEnded(1) * ADC_REFERENCE_VOLTAGE / ADC_RESOLUTION - IinverterOffset) / SENSOR_SENSITIVITY;
+    float Iload = (ads.readADC_SingleEnded(2) * ADC_REFERENCE_VOLTAGE / ADC_RESOLUTION - IloadOffset) / SENSOR_SENSITIVITY;
+
+    // Generate sine wave
+    float timeSeconds = currentTime / 1e6;
+    sineWave = sineAmplitude * sin(sineFrequency * timeSeconds);
+
+    // Generate repeating sequence
+    float modTime = fmod(timeSeconds, 0.0001);
+    repeatingSequence = (modTime < 0.00005) ? 1 : -1;
+
+    // PI Controller 1
+    error1 = sineWave - Vload;
+    integral1 += error1 * timeStep;
+    output1 = Kp1 * error1 + Ki1 * integral1;
+
+    // PI Controller 2
+    error2 = output1 - Iload;
+    integral2 += error2 * timeStep;
+    output2 = Kp2 * error2 + Ki2 * integral2;
+
+    // Generate PWM signals
+    int pwmValue = map(output2, -1, 1, 0, 255); // Scale to 8-bit range
+    pwmValue = constrain(pwmValue, 0, 255);
+
+    if (repeatingSequence > 0) {
+      analogWrite(PWM_A_HS, pwmValue); // High-side PWM A
+      analogWrite(PWM_A_LS, 0);       // Low-side PWM A
+      analogWrite(PWM_B_HS, 0);       // High-side PWM B
+      analogWrite(PWM_B_LS, pwmValue); // Low-side PWM B
+    } else {
+      analogWrite(PWM_A_HS, 0);       // High-side PWM A
+      analogWrite(PWM_A_LS, pwmValue); // Low-side PWM A
+      analogWrite(PWM_B_HS, pwmValue); // High-side PWM B
+      analogWrite(PWM_B_LS, 0);       // Low-side PWM B
+    }
+
+    // Debug information
+    Serial.println("Measurements:");
+    Serial.print("Vinput: "); Serial.print(Vinput, 2); Serial.println(" V");
+    Serial.print("Vload: "); Serial.print(Vload, 2); Serial.println(" V");
+    Serial.print("Iinverter: "); Serial.print(Iinverter, 2); Serial.println(" A");
+    Serial.print("Iload: "); Serial.print(Iload, 2); Serial.println(" A");
+    Serial.println("--------------------------------------");
+  }
+}
+
+// Function to calibrate sensors
+void calibrateSensors() {
+  const int calibrationSamples = 100;
+  float totalIinverter = 0.0, totalIload = 0.0;
+
+  for (int i = 0; i < calibrationSamples; i++) {
+    totalIinverter += ads.readADC_SingleEnded(1) * ADC_REFERENCE_VOLTAGE / ADC_RESOLUTION;
+    totalIload += ads.readADC_SingleEnded(2) * ADC_REFERENCE_VOLTAGE / ADC_RESOLUTION;
+    delay(10);
+  }
+
+  IinverterOffset = totalIinverter / calibrationSamples;
+  IloadOffset = totalIload / calibrationSamples;
+
+  Serial.print("Iinverter Offset: "); Serial.println(IinverterOffset, 4);
+  Serial.print("Iload Offset: "); Serial.println(IloadOffset, 4);
+}
